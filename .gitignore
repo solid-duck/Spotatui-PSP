@@ -1,0 +1,22 @@
+# Spotify - NON versionare
+backend/spotify_token.json
+backend/.env
+.env
+
+# PSP build
+*.o
+*.elf
+*.prx
+EBOOT.PBP
+PARAM.SFO
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Editor / OS
+.vscode/
+.DS_Store
+Thumbs.db
