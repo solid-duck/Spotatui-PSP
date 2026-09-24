@@ -8,13 +8,16 @@
 #include <pspnet_resolver.h>
 #include <psputility.h>
 #include <psputility_netmodules.h>
+#include <psputility_osk.h>
 #include <pspsdk.h>
+#include <psppower.h>
 
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
+#include <sys/select.h>
 #include <unistd.h>
 #include <errno.h>
 
@@ -75,6 +78,7 @@ typedef enum
     WLAN_ERROR_INET_INIT,
     WLAN_ERROR_RESOLVER_INIT,
     WLAN_ERROR_APCTL_INIT,
+    WLAN_ERROR_NETCONF,
     WLAN_ERROR_AP_CONNECT,
     WLAN_ERROR_AP_STATE,
     WLAN_ERROR_TIMEOUT,
@@ -127,6 +131,7 @@ AppScreen currentScreen = SCREEN_HOME;
 
 int selectedMenu = 0;
 int selectedSetting = 0;
+int settingsScroll = 0;
 
 volatile WlanStatus wlanStatus = WLAN_OFFLINE;
 volatile int wlanThreadRunning = 0;
@@ -136,16 +141,53 @@ volatile int wlanErrorCode = 0;
 char wlanIp[32] = "";
 
 
+#define BACKEND_HTTP_PORT 8080
+#define BACKEND_DISCOVERY_PORT 8081
+
+char backendIp[32] = "";
+volatile int backendDiscovered = 0;
+volatile int backendConnectError = 0;
+
+
 volatile HttpStatus httpStatus = HTTP_IDLE;
 volatile HttpErrorStage httpErrorStage = HTTP_ERROR_NONE;
 volatile int httpErrorCode = 0;
 volatile int httpThreadRunning = 0;
 volatile int httpResponseCode = 0;
 
+/* v0.16.4 NETWORK TRACE */
+volatile int traceSocketResult = -9999;
+volatile int traceConnectResult = -9999;
+volatile int traceSendResult = -9999;
+volatile int traceSendExpected = 0;
+volatile int traceRecvResult = -9999;
+volatile int traceInetErrno = 0;
+char traceBackendIp[32] = "";
+
 volatile SpotifyStatus spotifyStatus = SPOTIFY_UNKNOWN;
 volatile int spotifyThreadRunning = 0;
 volatile int spotifyResponseCode = 0;
 char spotifyUser[64] = "";
+
+
+#define SEARCH_MAX_RESULTS 5
+
+typedef struct
+{
+    char title[64];
+    char artist[64];
+    char id[32];
+} SearchResult;
+
+SearchResult searchResults[SEARCH_MAX_RESULTS];
+volatile int searchResultCount = 0;
+volatile int searchSelected = 0;
+volatile int searchThreadRunning = 0;
+volatile int searchPlayRunning = 0;
+volatile int searchStatusCode = 0;
+char searchQuery[64] = "";
+char searchMessage[64] = "PRESS X TO SEARCH";
+char pendingTrackId[32] = "";
 
 volatile int playerThreadRunning = 0;
 volatile int playerLoaded = 0;
@@ -421,20 +463,26 @@ void initGraphics(void)
 
     sceGuInit();
 
+    /*
+       PSP framebuffer pitch is 512 pixels even though the visible
+       display is 480 pixels wide. Allocate VRAM using the same pitch
+       passed to sceGuDrawBuffer/sceGuDispBuffer, otherwise the buffers
+       overlap and the beginning of the frame can reappear at the end.
+    */
     fbp0 = guGetStaticVramBuffer(
-        SCREEN_WIDTH,
+        512,
         SCREEN_HEIGHT,
         GU_PSM_8888
     );
 
     fbp1 = guGetStaticVramBuffer(
-        SCREEN_WIDTH,
+        512,
         SCREEN_HEIGHT,
         GU_PSM_8888
     );
 
     zbp = guGetStaticVramBuffer(
-        SCREEN_WIDTH,
+        512,
         SCREEN_HEIGHT,
         GU_PSM_4444
     );
@@ -739,6 +787,9 @@ const char *getWlanErrorStageText(void)
         case WLAN_ERROR_APCTL_INIT:
             return "APCTL INIT";
 
+        case WLAN_ERROR_NETCONF:
+            return "NETCONF";
+
         case WLAN_ERROR_AP_CONNECT:
             return "AP CONNECT";
 
@@ -780,297 +831,428 @@ void setWlanError(
    a disegnare l'interfaccia mentre la PSP tenta
    di collegarsi al Wi-Fi.
 */
-int wlanThread(
-    SceSize args,
-    void *argp
-)
+int networkStackInitialized = 0;
+
+int initNetworkStack(void)
 {
     int result;
-    int state;
-    int attempts = 0;
 
-    wlanThreadRunning = 1;
-    wlanStatus = WLAN_CONNECTING;
-    wlanErrorStage = WLAN_ERROR_NONE;
-    wlanErrorCode = 0;
+    if (networkStackInitialized)
+        return 1;
 
-    wlanIp[0] = '\0';
+    result = sceUtilityLoadNetModule(PSP_NET_MODULE_COMMON);
+    if (result < 0)
+    {
+        setWlanError(WLAN_ERROR_COMMON_MODULE, result);
+        return 0;
+    }
 
+    result = sceUtilityLoadNetModule(PSP_NET_MODULE_INET);
+    if (result < 0)
+    {
+        setWlanError(WLAN_ERROR_INET_MODULE, result);
+        return 0;
+    }
 
     /*
-       Carichiamo i moduli di rete della PSP.
+       v0.16.3 NETFIX
+
+       Usa l'inizializzazione INET fornita direttamente dal PSPSDK.
+       pspSdkInetInit() inizializza lo stack Net/Inet/Resolver/APCTL
+       con i parametri previsti dal SDK, evitando di mantenere qui
+       una seconda sequenza manuale divergente.
     */
-
-    result = sceUtilityLoadNetModule(
-        PSP_NET_MODULE_COMMON
-    );
+    result = pspSdkInetInit();
 
     if (result < 0)
     {
-        setWlanError(
-            WLAN_ERROR_COMMON_MODULE,
-            result
-        );
-
+        setWlanError(WLAN_ERROR_NET_INIT, result);
         return 0;
     }
 
+    networkStackInitialized = 1;
+    return 1;
+}
 
-    result = sceUtilityLoadNetModule(
-        PSP_NET_MODULE_INET
-    );
+int updateWlanFromApctl(void)
+{
+    int state = 0;
+    int result;
+    union SceNetApctlInfo info;
 
-    if (result < 0)
-    {
-        setWlanError(
-            WLAN_ERROR_INET_MODULE,
-            result
-        );
-
+    if (!networkStackInitialized)
         return 0;
-    }
 
-
-    /*
-       v0.5.4:
-       inizializzazione esplicita dello stack di rete, seguendo
-       la sequenza dell'esempio htmlviewer del PSPSDK.
-    */
-
-    result = sceNetInit(
-        0x20000,
-        0x2A,
-        0,
-        0x2A,
-        0
-    );
-
-    if (result < 0)
-    {
-        setWlanError(
-            WLAN_ERROR_NET_INIT,
-            result
-        );
-
-        return 0;
-    }
-
-
-    result = sceNetInetInit();
-
-    if (result < 0)
-    {
-        setWlanError(
-            WLAN_ERROR_INET_INIT,
-            result
-        );
-
-        return 0;
-    }
-
-
-    result = sceNetResolverInit();
-
-    if (result < 0)
-    {
-        setWlanError(
-            WLAN_ERROR_RESOLVER_INIT,
-            result
-        );
-
-        return 0;
-    }
-
-
-    result = sceNetApctlInit(
-        0x1800,
-        0x30
-    );
-
-    if (result < 0)
-    {
-        setWlanError(
-            WLAN_ERROR_APCTL_INIT,
-            result
-        );
-
-        return 0;
-    }
-
-
-    /*
-       Utilizziamo il profilo di rete numero 1
-       salvato nelle impostazioni della PSP.
-    */
-
-    result = sceNetApctlConnect(1);
+    result = sceNetApctlGetState(&state);
 
     if (result != 0)
     {
-        setWlanError(
-            WLAN_ERROR_AP_CONNECT,
-            result
-        );
-
+        wlanErrorStage = WLAN_ERROR_AP_STATE;
+        wlanErrorCode = result;
         return 0;
     }
 
+    if (state != 4)
+        return 0;
 
-    /*
-       Aspettiamo che APCTL raggiunga lo stato 4.
+    memset(&info, 0, sizeof(info));
 
-       Stato 4 = connessione completata
-       e indirizzo IP disponibile.
-
-       Mettiamo anche un limite ai tentativi
-       per evitare un'attesa infinita.
-    */
-
-    while (attempts < 400)
+    if (sceNetApctlGetInfo(8, &info) == 0)
     {
-        state = 0;
-
-        result = sceNetApctlGetState(
-            &state
+        strncpy(
+            wlanIp,
+            info.ip,
+            sizeof(wlanIp) - 1
         );
 
-        if (result != 0)
-        {
-            wlanStatus = WLAN_ERROR;
-            wlanThreadRunning = 0;
-
-            return 0;
-        }
-
-
-        if (state == 4)
-        {
-            union SceNetApctlInfo info;
-
-            wlanStatus = WLAN_ONLINE;
-
-            /*
-               Il codice 8 corrisponde
-               all'indirizzo IP.
-            */
-
-            if (
-                sceNetApctlGetInfo(
-                    8,
-                    &info
-                ) == 0
-            )
-            {
-                strncpy(
-                    wlanIp,
-                    info.ip,
-                    sizeof(wlanIp) - 1
-                );
-
-                wlanIp[
-                    sizeof(wlanIp) - 1
-                ] = '\0';
-            }
-
-            wlanThreadRunning = 0;
-
-            return 0;
-        }
-
-
-        sceKernelDelayThread(
-            50 * 1000
-        );
-
-        attempts++;
+        wlanIp[sizeof(wlanIp) - 1] = '\0';
+    }
+    else
+    {
+        wlanIp[0] = '\0';
     }
 
+    wlanStatus = WLAN_ONLINE;
+    wlanErrorStage = WLAN_ERROR_NONE;
+    wlanErrorCode = 0;
+    wlanThreadRunning = 0;
+
+    return 1;
+}
+
+
+/*
+   Apre il dialogo di rete ufficiale della PSP.
+
+   Spotatui non sceglie piu' un profilo numerico con
+   sceNetApctlConnect(1). La PSP mostra invece le connessioni
+   salvate e gestisce autonomamente quale configurazione usare.
+
+   Se APCTL e' gia' nello stato 4, il dialogo non viene aperto:
+   Spotatui usa direttamente la connessione gia' disponibile.
+*/
+int openNetworkDialog(void)
+{
+    pspUtilityNetconfData data;
+    struct pspUtilityNetconfAdhoc adhocparam;
+    int status;
+    int done = 0;
+    int initResult;
+
+    memset(&data, 0, sizeof(data));
+    memset(&adhocparam, 0, sizeof(adhocparam));
+
+    data.base.size = sizeof(data);
+    data.base.language = PSP_SYSTEMPARAM_LANGUAGE_ENGLISH;
+    data.base.buttonSwap = PSP_UTILITY_ACCEPT_CROSS;
+    data.base.graphicsThread = 17;
+    data.base.accessThread = 19;
+    data.base.fontThread = 18;
+    data.base.soundThread = 16;
+
+    data.action = PSP_NETCONF_ACTION_CONNECTAP;
+    data.adhocparam = &adhocparam;
+
+    initResult = sceUtilityNetconfInitStart(&data);
+
+    if (initResult < 0)
+    {
+        setWlanError(WLAN_ERROR_NETCONF, initResult);
+        return 0;
+    }
+
+    while (!done)
+    {
+        sceGuStart(GU_DIRECT, list);
+        sceGuClearColor(COLOR_BG);
+        sceGuClear(GU_COLOR_BUFFER_BIT);
+        sceGuFinish();
+        sceGuSync(GU_SYNC_FINISH, GU_SYNC_WHAT_DONE);
+
+        status = sceUtilityNetconfGetStatus();
+
+        switch (status)
+        {
+            case PSP_UTILITY_DIALOG_VISIBLE:
+                sceUtilityNetconfUpdate(1);
+                break;
+
+            case PSP_UTILITY_DIALOG_QUIT:
+                sceUtilityNetconfShutdownStart();
+                break;
+
+            case PSP_UTILITY_DIALOG_FINISHED:
+                done = 1;
+                break;
+
+            case PSP_UTILITY_DIALOG_NONE:
+                break;
+
+            default:
+                break;
+        }
+
+        sceDisplayWaitVblankStart();
+        sceGuSwapBuffers();
+    }
+
+    return 1;
+}
+
+
+/*
+   Connessione WLAN dinamica.
+
+   1. Inizializza lo stack di rete.
+   2. Se esiste gia' una connessione APCTL completa, la usa.
+   3. Altrimenti apre il Netconf ufficiale della PSP.
+   4. Dopo il dialogo controlla lo stato e recupera l'IP.
+
+   Nessun numero di profilo e' hardcoded.
+*/
+void startWlanConnection(void)
+{
+    int attempts = 0;
+
+    if (wlanThreadRunning)
+        return;
+
+    if (wlanStatus == WLAN_ONLINE && updateWlanFromApctl())
+        return;
+
+    wlanStatus = WLAN_CONNECTING;
+    wlanErrorStage = WLAN_ERROR_NONE;
+    wlanErrorCode = 0;
+    wlanIp[0] = '\0';
+
+    backendIp[0] = '\0';
+    backendDiscovered = 0;
+
+    wlanThreadRunning = 1;
+
+    if (!initNetworkStack())
+    {
+        wlanThreadRunning = 0;
+        return;
+    }
 
     /*
-       Se arriviamo qui abbiamo superato
-       il tempo massimo di connessione.
+       Caso ideale: APCTL e' gia' connesso.
+       Non chiediamo nulla all'utente e usiamo la rete corrente.
     */
+    if (updateWlanFromApctl())
+        return;
+
+    /*
+       Nessuna connessione APCTL attiva.
+       Lasciamo che sia il firmware PSP a gestire la connessione,
+       invece di imporre sceNetApctlConnect(1).
+    */
+    if (!openNetworkDialog())
+    {
+        wlanThreadRunning = 0;
+        return;
+    }
+
+    /*
+       Il dialogo puo' chiudersi poco prima del passaggio definitivo
+       allo stato 4. Attendiamo per un massimo di circa 10 secondi.
+    */
+    while (attempts < 200)
+    {
+        if (updateWlanFromApctl())
+            return;
+
+        sceKernelDelayThread(50 * 1000);
+        attempts++;
+    }
 
     setWlanError(
         WLAN_ERROR_TIMEOUT,
         0
     );
-
-    return 0;
 }
 
 
-void startWlanConnection(void)
+
+/* --------------------------------------------------
+   BACKEND AUTO DISCOVERY v0.16.1
+
+   Nessun IP del PC e' hardcoded.
+
+   Strategia:
+   1. broadcast globale 255.255.255.255:8081
+   2. broadcast diretto della /24 ricavata dall'IP WLAN
+      (es. 192.168.137.42 -> 192.168.137.255)
+   3. il backend risponde "SPOTATUI_BACKEND"
+   4. Spotatui usa automaticamente l'IP del mittente
+-------------------------------------------------- */
+
+int receiveBackendDiscovery(int socketId, int timeoutMs)
 {
-    SceUID threadId;
+    int result;
+    int received;
+    fd_set readSet;
+    struct timeval timeout;
+    struct sockaddr_in senderAddress;
+    socklen_t senderLength;
+    char response[96];
 
-    /*
-       Evitiamo di creare più thread
-       contemporaneamente.
-    */
+    FD_ZERO(&readSet);
+    FD_SET(socketId, &readSet);
 
-    if (wlanThreadRunning)
+    timeout.tv_sec = timeoutMs / 1000;
+    timeout.tv_usec = (timeoutMs % 1000) * 1000;
+
+    result = select(socketId + 1, &readSet, NULL, NULL, &timeout);
+
+    if (result < 0)
     {
-        return;
+        backendConnectError = errno;
+        return 0;
     }
 
+    if (result == 0 || !FD_ISSET(socketId, &readSet))
+        return 0;
 
-    /*
-       Se siamo già online non dobbiamo
-       riconnetterci.
-    */
+    senderLength = sizeof(senderAddress);
+    memset(&senderAddress, 0, sizeof(senderAddress));
+    memset(response, 0, sizeof(response));
 
-    if (wlanStatus == WLAN_ONLINE)
-    {
-        return;
-    }
-
-
-    wlanStatus = WLAN_CONNECTING;
-    wlanErrorStage = WLAN_ERROR_NONE;
-    wlanErrorCode = 0;
-    wlanIp[0] = '\0';
-    wlanThreadRunning = 1;
-
-
-    threadId = sceKernelCreateThread(
-        "SpotatuiWlanThread",
-        wlanThread,
-        0x11,
-        32 * 1024,
-        PSP_THREAD_ATTR_USER,
-        NULL
+    received = recvfrom(
+        socketId,
+        response,
+        sizeof(response) - 1,
+        0,
+        (struct sockaddr *)&senderAddress,
+        &senderLength
     );
 
-
-    if (threadId < 0)
+    if (received < 0)
     {
-        setWlanError(
-            WLAN_ERROR_THREAD_CREATE,
-            threadId
-        );
-
-        return;
+        backendConnectError = errno;
+        return 0;
     }
 
+    if (received == 0)
+        return 0;
+
+    response[received] = '\0';
+
+    if (strncmp(response, "SPOTATUI_BACKEND", 16) != 0)
+        return 0;
 
     {
-        int startResult;
+        const char *ip = inet_ntoa(senderAddress.sin_addr);
 
-        startResult = sceKernelStartThread(
-            threadId,
-            0,
-            NULL
-        );
+        if (ip == NULL || ip[0] == '\0')
+            return 0;
 
-        if (startResult < 0)
-        {
-            setWlanError(
-                WLAN_ERROR_THREAD_START,
-                startResult
-            );
-        }
+        strncpy(backendIp, ip, sizeof(backendIp) - 1);
+        backendIp[sizeof(backendIp) - 1] = '\0';
     }
+
+    backendDiscovered = 1;
+    backendConnectError = 0;
+    return 1;
+}
+
+int sendBackendDiscovery(int socketId, const char *targetIp)
+{
+    struct sockaddr_in address;
+    const char message[] = "SPOTATUI_DISCOVER";
+    int result;
+
+    memset(&address, 0, sizeof(address));
+    address.sin_family = AF_INET;
+    address.sin_port = htons(BACKEND_DISCOVERY_PORT);
+    address.sin_addr.s_addr = inet_addr(targetIp);
+
+    result = sendto(
+        socketId,
+        message,
+        strlen(message),
+        0,
+        (struct sockaddr *)&address,
+        sizeof(address)
+    );
+
+    if (result < 0)
+    {
+        backendConnectError = errno;
+        return 0;
+    }
+
+    return 1;
+}
+
+int getLocal24Broadcast(char *broadcastIp, int size)
+{
+    int a;
+    int b;
+    int c;
+    int d;
+
+    if (wlanIp[0] == '\0')
+        return 0;
+
+    if (sscanf(wlanIp, "%d.%d.%d.%d", &a, &b, &c, &d) != 4)
+        return 0;
+
+    if (a < 0 || a > 255 ||
+        b < 0 || b > 255 ||
+        c < 0 || c > 255 ||
+        d < 0 || d > 255)
+    {
+        return 0;
+    }
+
+    snprintf(
+        broadcastIp,
+        size,
+        "%d.%d.%d.255",
+        a,
+        b,
+        c
+    );
+
+    return 1;
+}
+
+int discoverBackend(void)
+{
+    /*
+       v0.16.2 TEST
+       Bypass temporaneo della discovery UDP.
+
+       Serve esclusivamente a verificare se PPSSPP riesce a
+       raggiungere il backend Windows tramite TCP diretto.
+    */
+    const char *testIp = "192.168.137.155";
+
+    if (wlanStatus != WLAN_ONLINE)
+    {
+        backendConnectError = 0;
+        return 0;
+    }
+
+    backendIp[0] = '\0';
+    backendDiscovered = 0;
+    backendConnectError = 0;
+
+    strncpy(backendIp, testIp, sizeof(backendIp) - 1);
+    backendIp[sizeof(backendIp) - 1] = '\0';
+    backendDiscovered = 1;
+
+    return 1;
+}
+
+int ensureBackend(void)
+{
+    if (backendDiscovered && backendIp[0] != '\0')
+        return 1;
+
+    return discoverBackend();
 }
 
 
@@ -1127,18 +1309,15 @@ void setHttpError(HttpErrorStage stage, int code)
 int httpThread(SceSize args, void *argp)
 {
     int socketId;
-    int result;
-    int received;
-    int totalReceived = 0;
+    int connectResult;
+    size_t sendResult;
+    size_t recvResult;
+    size_t totalReceived = 0;
     int statusCode = 0;
+    size_t requestLength;
     struct sockaddr_in serverAddress;
     char response[1024];
-    const char request[] =
-        "GET /ping HTTP/1.0\r\n"
-        "Host: 192.168.1.20:8080\r\n"
-        "User-Agent: SpotatuiPSP/0.10\r\n"
-        "Connection: close\r\n"
-        "\r\n";
+    char request[256];
 
     httpThreadRunning = 1;
     httpStatus = HTTP_CONNECTING;
@@ -1146,78 +1325,162 @@ int httpThread(SceSize args, void *argp)
     httpErrorCode = 0;
     httpResponseCode = 0;
 
+    traceSocketResult = -9999;
+    traceConnectResult = -9999;
+    traceSendResult = -9999;
+    traceSendExpected = 0;
+    traceRecvResult = -9999;
+    traceInetErrno = 0;
+    traceBackendIp[0] = '\0';
+
     if (wlanStatus != WLAN_ONLINE)
     {
         setHttpError(HTTP_ERROR_WLAN_OFFLINE, 0);
         return 0;
     }
 
-    socketId = socket(AF_INET, SOCK_STREAM, 0);
+    if (!ensureBackend())
+    {
+        traceInetErrno = backendConnectError;
+        setHttpError(HTTP_ERROR_CONNECTION, backendConnectError);
+        return 0;
+    }
+
+    strncpy(traceBackendIp, backendIp, sizeof(traceBackendIp) - 1);
+    traceBackendIp[sizeof(traceBackendIp) - 1] = '\0';
+
+    socketId = sceNetInetSocket(AF_INET, SOCK_STREAM, 0);
+    traceSocketResult = socketId;
+
     if (socketId < 0)
     {
-        setHttpError(HTTP_ERROR_CONNECTION, errno);
+        traceInetErrno = sceNetInetGetErrno();
+        setHttpError(HTTP_ERROR_CONNECTION, traceInetErrno);
         return 0;
     }
 
     memset(&serverAddress, 0, sizeof(serverAddress));
     serverAddress.sin_family = AF_INET;
-    serverAddress.sin_port = htons(8080);
-    serverAddress.sin_addr.s_addr = inet_addr("192.168.1.20");
+    serverAddress.sin_port = htons(BACKEND_HTTP_PORT);
+    serverAddress.sin_addr.s_addr = inet_addr(backendIp);
 
-    result = connect(
+    connectResult = sceNetInetConnect(
         socketId,
         (struct sockaddr *)&serverAddress,
         sizeof(serverAddress)
     );
 
-    if (result < 0)
+    traceConnectResult = connectResult;
+
+    if (connectResult < 0)
     {
-        close(socketId);
-        setHttpError(HTTP_ERROR_CONNECTION, errno);
+        traceInetErrno = sceNetInetGetErrno();
+        sceNetInetClose(socketId);
+        setHttpError(HTTP_ERROR_CONNECTION, traceInetErrno);
         return 0;
     }
 
-    result = send(
+    snprintf(
+        request,
+        sizeof(request),
+        "GET /ping HTTP/1.0\r\n"
+        "Host: %s:%d\r\n"
+        "User-Agent: SpotatuiPSP/0.16.5-NATIVE\r\n"
+        "Connection: close\r\n"
+        "\r\n",
+        backendIp,
+        BACKEND_HTTP_PORT
+    );
+
+    requestLength = strlen(request);
+    traceSendExpected = (int)requestLength;
+
+    sendResult = sceNetInetSend(
         socketId,
         request,
-        strlen(request),
+        requestLength,
         0
     );
 
-    if (result < 0)
+    if (sendResult == (size_t)-1)
     {
-        close(socketId);
-        setHttpError(HTTP_ERROR_SEND, errno);
+        traceSendResult = -1;
+        traceInetErrno = sceNetInetGetErrno();
+        sceNetInetClose(socketId);
+        setHttpError(HTTP_ERROR_SEND, traceInetErrno);
         return 0;
+    }
+
+    traceSendResult = (int)sendResult;
+
+    /*
+       Una send TCP può inviare meno byte di quelli richiesti.
+       Completiamo quindi esplicitamente l'intera richiesta HTTP.
+    */
+    while (sendResult < requestLength)
+    {
+        size_t moreSent = sceNetInetSend(
+            socketId,
+            request + sendResult,
+            requestLength - sendResult,
+            0
+        );
+
+        if (moreSent == (size_t)-1)
+        {
+            traceSendResult = -1;
+            traceInetErrno = sceNetInetGetErrno();
+            sceNetInetClose(socketId);
+            setHttpError(HTTP_ERROR_SEND, traceInetErrno);
+            return 0;
+        }
+
+        if (moreSent == 0)
+        {
+            traceInetErrno = 0;
+            sceNetInetClose(socketId);
+            setHttpError(HTTP_ERROR_SEND, 0);
+            return 0;
+        }
+
+        sendResult += moreSent;
+        traceSendResult = (int)sendResult;
     }
 
     memset(response, 0, sizeof(response));
 
-    while (totalReceived < (int)sizeof(response) - 1)
+    while (totalReceived < sizeof(response) - 1)
     {
-        received = recv(
+        recvResult = sceNetInetRecv(
             socketId,
             response + totalReceived,
             sizeof(response) - 1 - totalReceived,
             0
         );
 
-        if (received < 0)
+        if (recvResult == (size_t)-1)
         {
-            close(socketId);
-            setHttpError(HTTP_ERROR_STATUS, errno);
+            traceRecvResult = -1;
+            traceInetErrno = sceNetInetGetErrno();
+            sceNetInetClose(socketId);
+            setHttpError(HTTP_ERROR_STATUS, traceInetErrno);
             return 0;
         }
 
-        if (received == 0) break;
-        totalReceived += received;
+        traceRecvResult = (int)recvResult;
+
+        if (recvResult == 0)
+            break;
+
+        totalReceived += recvResult;
     }
 
     response[totalReceived] = '\0';
-    close(socketId);
+    sceNetInetClose(socketId);
 
     if (sscanf(response, "HTTP/%*s %d", &statusCode) != 1)
     {
+        traceInetErrno = -1;
         setHttpError(HTTP_ERROR_STATUS, -1);
         return 0;
     }
@@ -1311,13 +1574,15 @@ int backendCommand(
 
     if (wlanStatus != WLAN_ONLINE) return -1;
 
+    if (!ensureBackend()) return -7;
+
     socketId = socket(AF_INET, SOCK_STREAM, 0);
     if (socketId < 0) return -2;
 
     memset(&serverAddress, 0, sizeof(serverAddress));
     serverAddress.sin_family = AF_INET;
-    serverAddress.sin_port = htons(8080);
-    serverAddress.sin_addr.s_addr = inet_addr("192.168.1.20");
+    serverAddress.sin_port = htons(BACKEND_HTTP_PORT);
+    serverAddress.sin_addr.s_addr = inet_addr(backendIp);
 
     result = connect(
         socketId,
@@ -1335,13 +1600,15 @@ int backendCommand(
         request,
         sizeof(request),
         "%s %s HTTP/1.0\r\n"
-        "Host: 192.168.1.20:8080\r\n"
-        "User-Agent: SpotatuiPSP/0.10\r\n"
+        "Host: %s:%d\r\n"
+        "User-Agent: SpotatuiPSP/0.16.5-NATIVE\r\n"
         "Content-Length: 0\r\n"
         "Connection: close\r\n"
         "\r\n",
         method,
-        path
+        path,
+        backendIp,
+        BACKEND_HTTP_PORT
     );
 
     result = send(socketId, request, strlen(request), 0);
@@ -1393,13 +1660,15 @@ int backendGet(const char *path, char *response, int responseSize, int *statusCo
 
     if (wlanStatus != WLAN_ONLINE) return -1;
 
+    if (!ensureBackend()) return -7;
+
     socketId = socket(AF_INET, SOCK_STREAM, 0);
     if (socketId < 0) return -2;
 
     memset(&serverAddress, 0, sizeof(serverAddress));
     serverAddress.sin_family = AF_INET;
-    serverAddress.sin_port = htons(8080);
-    serverAddress.sin_addr.s_addr = inet_addr("192.168.1.20");
+    serverAddress.sin_port = htons(BACKEND_HTTP_PORT);
+    serverAddress.sin_addr.s_addr = inet_addr(backendIp);
 
     result = connect(
         socketId,
@@ -1417,11 +1686,13 @@ int backendGet(const char *path, char *response, int responseSize, int *statusCo
         request,
         sizeof(request),
         "GET %s HTTP/1.0\r\n"
-        "Host: 192.168.1.20:8080\r\n"
-        "User-Agent: SpotatuiPSP/0.10\r\n"
+        "Host: %s:%d\r\n"
+        "User-Agent: SpotatuiPSP/0.16.5-NATIVE\r\n"
         "Connection: close\r\n"
         "\r\n",
-        path
+        path,
+        backendIp,
+        BACKEND_HTTP_PORT
     );
 
     result = send(socketId, request, strlen(request), 0);
@@ -1574,6 +1845,351 @@ void startSpotifyCheck(void)
     {
         spotifyStatus = SPOTIFY_ERROR;
         spotifyThreadRunning = 0;
+    }
+}
+
+
+
+void trimLine(char *text);
+void startPlayerRefresh(void);
+
+/* --------------------------------------------------
+   SPOTIFY SEARCH - NATIVE PSP OSK
+-------------------------------------------------- */
+
+void asciiToUcs2(const char *source, unsigned short *dest, int maxChars)
+{
+    int i = 0;
+
+    if (maxChars <= 0) return;
+
+    while (source[i] != '\0' && i < maxChars - 1)
+    {
+        dest[i] = (unsigned short)(unsigned char)source[i];
+        i++;
+    }
+
+    dest[i] = 0;
+}
+
+void ucs2ToAscii(const unsigned short *source, char *dest, int maxChars)
+{
+    int i = 0;
+
+    if (maxChars <= 0) return;
+
+    while (source[i] != 0 && i < maxChars - 1)
+    {
+        unsigned short c = source[i];
+
+        if (c >= 'a' && c <= 'z')
+            c = (unsigned short)(c - 'a' + 'A');
+
+        if ((c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9') ||
+            c == ' ' || c == '.' || c == '-' || c == '/')
+        {
+            dest[i] = (char)c;
+        }
+        else
+        {
+            dest[i] = ' ';
+        }
+
+        i++;
+    }
+
+    dest[i] = '\0';
+}
+
+int urlEncode(const char *source, char *dest, int destSize)
+{
+    const char hex[] = "0123456789ABCDEF";
+    int in = 0;
+    int out = 0;
+
+    while (source[in] != '\0' && out < destSize - 1)
+    {
+        unsigned char c = (unsigned char)source[in];
+
+        if ((c >= 'A' && c <= 'Z') ||
+            (c >= 'a' && c <= 'z') ||
+            (c >= '0' && c <= '9') ||
+            c == '-' || c == '_' || c == '.' || c == '~')
+        {
+            dest[out++] = (char)c;
+        }
+        else
+        {
+            if (out + 3 >= destSize) break;
+            dest[out++] = '%';
+            dest[out++] = hex[(c >> 4) & 0x0F];
+            dest[out++] = hex[c & 0x0F];
+        }
+
+        in++;
+    }
+
+    dest[out] = '\0';
+    return out;
+}
+
+int openSearchOsk(void)
+{
+    SceUtilityOskData data;
+    SceUtilityOskParams params;
+    unsigned short description[64];
+    unsigned short input[64];
+    unsigned short output[64];
+    int status;
+
+    memset(&data, 0, sizeof(data));
+    memset(&params, 0, sizeof(params));
+    memset(description, 0, sizeof(description));
+    memset(input, 0, sizeof(input));
+    memset(output, 0, sizeof(output));
+
+    asciiToUcs2("SEARCH SPOTIFY", description, 64);
+    asciiToUcs2(searchQuery, input, 64);
+
+    data.language = PSP_UTILITY_OSK_LANGUAGE_DEFAULT;
+    data.lines = 1;
+    data.unk_24 = 1;
+    data.inputtype = PSP_UTILITY_OSK_INPUTTYPE_ALL;
+    data.desc = description;
+    data.intext = input;
+    data.outtextlength = 64;
+    data.outtextlimit = 42;
+    data.outtext = output;
+
+    params.base.size = sizeof(params);
+    params.base.language = PSP_SYSTEMPARAM_LANGUAGE_ENGLISH;
+    params.base.buttonSwap = PSP_UTILITY_ACCEPT_CROSS;
+    params.base.graphicsThread = 17;
+    params.base.accessThread = 19;
+    params.base.fontThread = 18;
+    params.base.soundThread = 16;
+    params.datacount = 1;
+    params.data = &data;
+
+    if (sceUtilityOskInitStart(&params) < 0)
+        return 0;
+
+    while (1)
+    {
+        status = sceUtilityOskGetStatus();
+
+        if (status == PSP_UTILITY_DIALOG_VISIBLE)
+        {
+            sceUtilityOskUpdate(1);
+        }
+        else if (status == PSP_UTILITY_DIALOG_QUIT)
+        {
+            sceUtilityOskShutdownStart();
+        }
+        else if (status == PSP_UTILITY_DIALOG_NONE)
+        {
+            break;
+        }
+
+        sceDisplayWaitVblankStart();
+    }
+
+    if (data.result == PSP_UTILITY_OSK_RESULT_CHANGED)
+    {
+        ucs2ToAscii(output, searchQuery, sizeof(searchQuery));
+
+        if (searchQuery[0] != '\0')
+            return 1;
+    }
+
+    return 0;
+}
+
+int searchThread(SceSize args, void *argp)
+{
+    char encoded[192];
+    char path[256];
+    char response[4096];
+    char *body;
+    char *line;
+    int statusCode = 0;
+    int result;
+
+    searchThreadRunning = 1;
+    searchResultCount = 0;
+    searchSelected = 0;
+    searchStatusCode = 0;
+    strcpy(searchMessage, "SEARCHING...");
+
+    urlEncode(searchQuery, encoded, sizeof(encoded));
+    snprintf(path, sizeof(path), "/spotify/search?q=%s", encoded);
+
+    result = backendGet(path, response, sizeof(response), &statusCode);
+    searchStatusCode = statusCode;
+
+    if (result < 0 || statusCode != 200)
+    {
+        strcpy(searchMessage, "SEARCH ERROR");
+        searchThreadRunning = 0;
+        return 0;
+    }
+
+    body = (char *)getHttpBody(response);
+    trimLine(body);
+
+    if (strncmp(body, "NONE", 4) == 0 || body[0] == '\0')
+    {
+        strcpy(searchMessage, "NO RESULTS");
+        searchThreadRunning = 0;
+        return 0;
+    }
+
+    line = strtok(body, "\n");
+
+    while (line != NULL && searchResultCount < SEARCH_MAX_RESULTS)
+    {
+        char *title;
+        char *artist;
+        char *id;
+
+        trimLine(line);
+
+        title = strtok(line, "|");
+        artist = strtok(NULL, "|");
+        id = strtok(NULL, "|");
+
+        if (title != NULL && artist != NULL && id != NULL)
+        {
+            strncpy(searchResults[searchResultCount].title, title,
+                    sizeof(searchResults[searchResultCount].title) - 1);
+            searchResults[searchResultCount].title[
+                sizeof(searchResults[searchResultCount].title) - 1] = '\0';
+
+            strncpy(searchResults[searchResultCount].artist, artist,
+                    sizeof(searchResults[searchResultCount].artist) - 1);
+            searchResults[searchResultCount].artist[
+                sizeof(searchResults[searchResultCount].artist) - 1] = '\0';
+
+            strncpy(searchResults[searchResultCount].id, id,
+                    sizeof(searchResults[searchResultCount].id) - 1);
+            searchResults[searchResultCount].id[
+                sizeof(searchResults[searchResultCount].id) - 1] = '\0';
+
+            searchResultCount++;
+        }
+
+        line = strtok(NULL, "\n");
+    }
+
+    if (searchResultCount > 0)
+        snprintf(searchMessage, sizeof(searchMessage), "%d RESULTS", searchResultCount);
+    else
+        strcpy(searchMessage, "NO RESULTS");
+
+    searchThreadRunning = 0;
+    return 0;
+}
+
+void startSearch(void)
+{
+    SceUID threadId;
+
+    if (searchThreadRunning || wlanStatus != WLAN_ONLINE || searchQuery[0] == '\0')
+        return;
+
+    searchThreadRunning = 1;
+
+    threadId = sceKernelCreateThread(
+        "SpotatuiSearchThread",
+        searchThread,
+        0x11,
+        24 * 1024,
+        PSP_THREAD_ATTR_USER,
+        NULL
+    );
+
+    if (threadId < 0)
+    {
+        searchThreadRunning = 0;
+        strcpy(searchMessage, "THREAD ERROR");
+        return;
+    }
+
+    if (sceKernelStartThread(threadId, 0, NULL) < 0)
+    {
+        searchThreadRunning = 0;
+        strcpy(searchMessage, "THREAD ERROR");
+    }
+}
+
+int searchPlayThread(SceSize args, void *argp)
+{
+    char path[128];
+    char response[512];
+    int statusCode = 0;
+    int result;
+
+    searchPlayRunning = 1;
+
+    snprintf(path, sizeof(path), "/spotify/play-track?id=%s", pendingTrackId);
+    result = backendGet(path, response, sizeof(response), &statusCode);
+
+    if (result == 0 && statusCode >= 200 && statusCode < 300)
+    {
+        strcpy(searchMessage, "PLAYING");
+        sceKernelDelayThread(300000);
+        startPlayerRefresh();
+    }
+    else
+    {
+        strcpy(searchMessage, "PLAY ERROR");
+    }
+
+    searchPlayRunning = 0;
+    return 0;
+}
+
+void playSelectedSearchResult(void)
+{
+    SceUID threadId;
+
+    if (searchPlayRunning ||
+        searchResultCount <= 0 ||
+        searchSelected < 0 ||
+        searchSelected >= searchResultCount ||
+        wlanStatus != WLAN_ONLINE)
+    {
+        return;
+    }
+
+    strncpy(pendingTrackId, searchResults[searchSelected].id,
+            sizeof(pendingTrackId) - 1);
+    pendingTrackId[sizeof(pendingTrackId) - 1] = '\0';
+
+    searchPlayRunning = 1;
+    strcpy(searchMessage, "SENDING...");
+
+    threadId = sceKernelCreateThread(
+        "SpotatuiSearchPlay",
+        searchPlayThread,
+        0x12,
+        16 * 1024,
+        PSP_THREAD_ATTR_USER,
+        NULL
+    );
+
+    if (threadId < 0)
+    {
+        searchPlayRunning = 0;
+        strcpy(searchMessage, "THREAD ERROR");
+        return;
+    }
+
+    if (sceKernelStartThread(threadId, 0, NULL) < 0)
+    {
+        searchPlayRunning = 0;
+        strcpy(searchMessage, "THREAD ERROR");
     }
 }
 
@@ -1813,12 +2429,12 @@ void drawScanlines(void)
 {
     int y;
 
-    for (y = 48; y < 218; y += 6)
+    for (y = 6; y < 268; y += 6)
     {
         drawLine(
-            17.0f,
+            4.0f,
             (float)y,
-            463.0f,
+            476.0f,
             (float)y,
             COLOR_SCAN
         );
@@ -1853,7 +2469,7 @@ void drawBootScreen(void)
     drawRectangle(15.0f, 12.0f, 450.0f, 248.0f, COLOR_DIM);
 
     drawText(28.0f, 24.0f, "VR SYSTEM", 1.0f, COLOR_GREEN);
-    drawText(393.0f, 24.0f, "VER 0.11", 0.8f, COLOR_DIM);
+    drawText(393.0f, 24.0f, "VER 0.12", 0.8f, COLOR_DIM);
     drawLine(15.0f, 42.0f, 465.0f, 42.0f, COLOR_GREEN);
 
     drawRectangle(124.0f, 72.0f, 232.0f, 54.0f, COLOR_GREEN);
@@ -1881,109 +2497,178 @@ void drawBootScreen(void)
 
 
 /* --------------------------------------------------
-   UI v0.11.4 - LAYOUT DEFINITIVO 480x272
+   UI v0.15.1 - REAL PSP READABILITY PASS
 -------------------------------------------------- */
 
-void drawAppSidebar(int activeItem)
+void drawTextLimited(float x, float y, const char *text, int maxChars, float scale, unsigned int color)
 {
-    const char *items[5] = {
-        "NOW PLAYING",
-        "SEARCH",
-        "PLAYLISTS",
-        "YOUR LIBRARY",
-        "SETTINGS"
-    };
-    int i;
-
-    /* Una sola divisione verticale: niente box annidati. */
-    drawLine(132.0f, 14.0f, 132.0f, 258.0f, COLOR_GREEN);
-    drawText(15.0f, 20.0f, "SPOTATUI", 1.12f, COLOR_GREEN);
-    drawText(15.0f, 39.0f, "PSP", 1.12f, COLOR_GREEN);
-    drawText(15.0f, 60.0f, "v0.11.4", 0.82f, COLOR_DIM);
-
-    for (i = 0; i < 5; i++)
+    char buffer[64];
+    int i = 0;
+    if (maxChars > 63) maxChars = 63;
+    while (text[i] != '\0' && i < maxChars)
     {
-        float y = 91.0f + (i * 27.0f);
-        if (i == activeItem)
-        {
-            drawFilledRectangle(10.0f, y - 6.0f, 116.0f, 22.0f, COLOR_GREEN);
-            drawText(15.0f, y, ">", 0.86f, COLOR_BG);
-            drawText(31.0f, y, items[i], 0.74f, COLOR_BG);
-        }
-        else
-        {
-            drawText(15.0f, y, "|-", 0.68f, COLOR_GREEN);
-            drawText(31.0f, y, items[i], 0.74f, COLOR_TEXT);
-        }
+        buffer[i] = text[i];
+        i++;
     }
-
-    drawLine(14.0f, 231.0f, 122.0f, 231.0f, COLOR_DIM);
-    drawText(15.0f, 240.0f, "VR MUSIC", 0.66f, COLOR_DIM);
-    drawText(15.0f, 252.0f, "TERMINAL", 0.66f, COLOR_DIM);
+    buffer[i] = '\0';
+    drawText(x, y, buffer, scale, color);
 }
 
-void drawContentTitle(const char *title)
+void drawPageHeader(const char *title)
 {
-    drawText(148.0f, 20.0f, title, 1.30f, COLOR_GREEN);
-    drawLine(146.0f, 48.0f, 466.0f, 48.0f, COLOR_DIM);
+    drawText(22.0f, 12.0f, title, 1.55f, COLOR_GREEN);
+    drawText(410.0f, 17.0f, "v0.16.5", 1.00f, COLOR_DIM);
+    drawLine(22.0f, 40.0f, 458.0f, 40.0f, COLOR_GREEN);
+}
+
+void drawPageFooter(const char *left, const char *right)
+{
+    drawFilledRectangle(0.0f, 247.0f, 480.0f, 25.0f, COLOR_BG);
+    drawLine(22.0f, 246.0f, 458.0f, 246.0f, COLOR_DIM);
+    drawText(24.0f, 253.0f, left, 1.00f, COLOR_TEXT);
+    drawText(350.0f, 253.0f, right, 1.00f, COLOR_TEXT);
+}
+
+void drawLargeInfoRow(float y, const char *label, const char *value, int selected)
+{
+    unsigned int fg = selected ? COLOR_BG : COLOR_TEXT;
+    unsigned int sub = selected ? COLOR_BG : COLOR_GREEN;
+    if (selected)
+        drawFilledRectangle(22.0f, y, 436.0f, 42.0f, COLOR_GREEN);
+    else
+        drawRectangle(22.0f, y, 436.0f, 42.0f, COLOR_DIM);
+
+    if (selected) drawText(33.0f, y + 12.0f, ">", 1.05f, fg);
+    drawText(57.0f, y + 10.0f, label, 1.05f, fg);
+    drawTextLimited(276.0f, y + 10.0f, value, 16, 1.00f, sub);
 }
 
 void drawHome(void)
 {
-    /* HOME usa lo stesso design system; la selezione mantiene la logica del menu. */
-    int visualItem;
-    if (selectedMenu == 3) visualItem = 0;
-    else if (selectedMenu == 0) visualItem = 1;
-    else if (selectedMenu == 1) visualItem = 2;
-    else if (selectedMenu == 2) visualItem = 3;
-    else visualItem = 4;
+    const char *items[6] = {
+        "NOW PLAYING", "SEARCH", "PLAYLISTS",
+        "YOUR LIBRARY", "SETTINGS", "EXIT"
+    };
+    int firstVisible;
+    int i;
+    int row;
+    float y;
 
-    drawAppSidebar(visualItem);
-    drawContentTitle("VR AUDIO TERMINAL");
+    drawText(24.0f, 14.0f, "SPOTATUI", 1.85f, COLOR_GREEN);
+    drawText(26.0f, 42.0f, "PSP // AUDIO TERMINAL", 1.00f, COLOR_TEXT);
+    drawText(410.0f, 19.0f, "v0.16.5", 1.00f, COLOR_DIM);
+    drawLine(24.0f, 65.0f, 456.0f, 65.0f, COLOR_GREEN);
 
-    drawText(151.0f, 72.0f, "SYSTEM STATUS", 0.92f, COLOR_DIM);
-    drawText(151.0f, 102.0f, "WLAN", 0.88f, COLOR_TEXT);
-    drawText(350.0f, 102.0f, getWlanStatusText(), 0.88f, getWlanStatusColor());
-    drawLine(151.0f, 121.0f, 454.0f, 121.0f, COLOR_DIM);
+    if (selectedMenu <= 1) firstVisible = 0;
+    else if (selectedMenu >= 4) firstVisible = 2;
+    else firstVisible = selectedMenu - 1;
 
-    drawText(151.0f, 137.0f, "SERVER", 0.88f, COLOR_TEXT);
-    drawText(350.0f, 137.0f, httpStatus == HTTP_OK ? "OK" : "STANDBY", 0.88f,
-             httpStatus == HTTP_OK ? COLOR_GREEN : COLOR_DIM);
-    drawLine(151.0f, 156.0f, 454.0f, 156.0f, COLOR_DIM);
+    for (row = 0; row < 4; row++)
+    {
+        i = firstVisible + row;
+        y = 76.0f + (row * 43.0f);
+        if (i == selectedMenu)
+        {
+            drawFilledRectangle(24.0f, y, 432.0f, 36.0f, COLOR_GREEN);
+            drawText(36.0f, y + 8.0f, ">", 1.20f, COLOR_BG);
+            drawText(67.0f, y + 7.0f, items[i], 1.25f, COLOR_BG);
+        }
+        else
+        {
+            drawRectangle(24.0f, y, 432.0f, 36.0f, COLOR_DIM);
+            drawText(67.0f, y + 8.0f, items[i], 1.10f, COLOR_TEXT);
+        }
+    }
 
-    drawText(151.0f, 172.0f, "SPOTIFY", 0.88f, COLOR_TEXT);
-    drawText(350.0f, 172.0f, getSpotifyStatusText(), 0.82f, getSpotifyStatusColor());
-
-    drawText(151.0f, 213.0f, "TACTICAL MUSIC INTERFACE", 0.78f, COLOR_DIM);
-    drawText(151.0f, 234.0f, "X SELECT", 0.76f, COLOR_GREEN);
+    drawFilledRectangle(0.0f, 254.0f, 480.0f, 18.0f, COLOR_BG);
+    drawLine(24.0f, 253.0f, 456.0f, 253.0f, COLOR_DIM);
+    drawText(27.0f, 258.0f, "UP/DOWN NAV", 1.00f, COLOR_TEXT);
+    drawText(399.0f, 258.0f, "X OPEN", 1.00f, COLOR_TEXT);
 }
 
 void drawSearchScreen(void)
 {
-    drawAppSidebar(1);
-    drawContentTitle("SEARCH");
-    drawText(151.0f, 85.0f, "SEARCH TERMINAL", 1.12f, COLOR_GREEN);
-    drawLine(151.0f, 119.0f, 451.0f, 119.0f, COLOR_DIM);
-    drawText(157.0f, 132.0f, "> WAITING FOR INPUT", 0.90f, COLOR_DIM);
-    drawText(382.0f, 245.0f, "O BACK", 0.72f, COLOR_DIM);
+    int firstVisible;
+    int row;
+    int index;
+    float y;
+
+    drawPageHeader("SEARCH");
+
+    if (searchQuery[0] == '\0')
+        drawText(24.0f, 54.0f, "X NEW SEARCH", 1.15f, COLOR_GREEN);
+    else
+    {
+        drawTextLimited(24.0f, 52.0f, searchQuery, 34, 1.15f, COLOR_GREEN);
+        drawText(24.0f, 72.0f, searchMessage, 1.00f,
+                 searchThreadRunning || searchPlayRunning ? COLOR_TEXT : COLOR_DIM);
+    }
+
+    if (searchResultCount <= 0)
+    {
+        drawRectangle(24.0f, 101.0f, 432.0f, 66.0f, COLOR_DIM);
+        drawText(39.0f, 119.0f,
+                 searchThreadRunning ? "SEARCHING SPOTIFY" :
+                 (searchQuery[0] == '\0' ? "PRESS X TO TYPE" : searchMessage),
+                 1.20f,
+                 searchThreadRunning ? COLOR_GREEN : COLOR_TEXT);
+
+        drawPageFooter("X SEARCH", "O BACK");
+        return;
+    }
+
+    if (searchSelected <= 0) firstVisible = 0;
+    else if (searchSelected >= searchResultCount - 1) firstVisible = searchResultCount - 2;
+    else firstVisible = searchSelected - 1;
+
+    if (firstVisible < 0) firstVisible = 0;
+    if (firstVisible > searchResultCount - 2) firstVisible = searchResultCount - 2;
+    if (firstVisible < 0) firstVisible = 0;
+
+    for (row = 0; row < 2; row++)
+    {
+        index = firstVisible + row;
+        if (index >= searchResultCount) break;
+
+        y = 95.0f + row * 66.0f;
+
+        if (index == searchSelected)
+        {
+            drawFilledRectangle(24.0f, y, 432.0f, 58.0f, COLOR_GREEN);
+            drawTextLimited(38.0f, y + 10.0f,
+                            searchResults[index].title, 31, 1.12f, COLOR_BG);
+            drawTextLimited(38.0f, y + 33.0f,
+                            searchResults[index].artist, 36, 1.00f, COLOR_BG);
+        }
+        else
+        {
+            drawRectangle(24.0f, y, 432.0f, 58.0f, COLOR_DIM);
+            drawTextLimited(38.0f, y + 10.0f,
+                            searchResults[index].title, 31, 1.12f, COLOR_TEXT);
+            drawTextLimited(38.0f, y + 33.0f,
+                            searchResults[index].artist, 36, 1.00f, COLOR_DIM);
+        }
+    }
+
+    drawPageFooter("UP/DOWN NAV", "X PLAY  TRI SEARCH");
 }
 
 void drawPlaylistsScreen(void)
 {
-    drawAppSidebar(2);
-    drawContentTitle("PLAYLISTS");
-    drawText(151.0f, 91.0f, "NO PLAYLIST DATA", 1.12f, COLOR_DIM);
-    drawText(151.0f, 121.0f, "SPOTIFY LINK REQUIRED", 0.86f, COLOR_DIM);
-    drawText(382.0f, 245.0f, "O BACK", 0.72f, COLOR_DIM);
+    drawPageHeader("PLAYLISTS");
+    drawText(24.0f, 69.0f, "YOUR PLAYLISTS", 1.05f, COLOR_DIM);
+    drawLargeInfoRow(101.0f, "SPOTIFY", "SYNC PENDING", 0);
+    drawLargeInfoRow(151.0f, "PLAYLISTS", "NO DATA", 0);
+    drawPageFooter("O BACK", "START HOME");
 }
 
 void drawLibraryScreen(void)
 {
-    drawAppSidebar(3);
-    drawContentTitle("YOUR LIBRARY");
-    drawText(151.0f, 91.0f, "LIBRARY OFFLINE", 1.12f, COLOR_DIM);
-    drawText(151.0f, 121.0f, "NO LOCAL CACHE", 0.86f, COLOR_DIM);
-    drawText(382.0f, 245.0f, "O BACK", 0.72f, COLOR_DIM);
+    drawPageHeader("YOUR LIBRARY");
+    drawText(24.0f, 69.0f, "SAVED MUSIC", 1.05f, COLOR_DIM);
+    drawLargeInfoRow(101.0f, "LIBRARY", "SYNC PENDING", 0);
+    drawLargeInfoRow(151.0f, "TRACKS", "NO DATA", 0);
+    drawPageFooter("O BACK", "START HOME");
 }
 
 void drawNowPlayingScreen(void)
@@ -2013,108 +2698,298 @@ void drawNowPlayingScreen(void)
     else if (playerLoaded) { linkText = "CONNECTED"; linkColor = COLOR_GREEN; }
     else { linkText = "STANDBY"; linkColor = COLOR_DIM; }
 
-    drawAppSidebar(0);
-    drawContentTitle("NOW PLAYING");
+    drawPageHeader("NOW PLAYING");
+    drawText(350.0f, 50.0f, linkText, 1.00f, linkColor);
 
-    drawText(392.0f, 17.0f, "SPOTIFY", 0.70f, COLOR_GREEN);
-    drawText(392.0f, 32.0f, linkText, 0.66f, linkColor);
+    drawTextLimited(24.0f, 69.0f,
+        playerLoaded ? playerTrack : "NO ACTIVE TRACK", 24, 1.45f,
+        playerLoaded ? COLOR_GREEN : COLOR_TEXT);
+    drawTextLimited(24.0f, 101.0f,
+        playerLoaded ? playerArtist : "WAITING FOR SPOTIFY", 30, 1.10f, COLOR_TEXT);
 
-    /* Cover placeholder: un solo riquadro funzionale. */
-    drawRectangle(150.0f, 67.0f, 86.0f, 86.0f, COLOR_GREEN);
-    drawText(168.0f, 91.0f, "VR", 1.70f, COLOR_GREEN);
-    drawText(164.0f, 120.0f, "AUDIO", 0.82f, COLOR_TEXT);
-
-    drawText(250.0f, 72.0f,
-             playerLoaded ? playerTrack : "NO ACTIVE TRACK",
-             1.12f,
-             playerLoaded ? COLOR_GREEN : COLOR_TEXT);
-    drawText(250.0f, 100.0f,
-             playerLoaded ? playerArtist : "WAITING FOR SPOTIFY",
-             0.78f, COLOR_TEXT);
-    drawText(250.0f, 130.0f,
-             playerLoaded ? (playerIsPlaying ? "> PLAYING" : "|| PAUSED") : "- STANDBY",
-             0.84f,
-             playerLoaded ? COLOR_GREEN : COLOR_DIM);
+    drawText(24.0f, 132.0f,
+        playerLoaded ? (playerIsPlaying ? "> PLAYING" : "PAUSED") : "STANDBY",
+        1.05f, playerLoaded ? COLOR_GREEN : COLOR_DIM);
 
     if (playerDurationMs > 0)
     {
-        progressWidth = 196.0f * ((float)shownProgressMs / (float)playerDurationMs);
+        progressWidth = 326.0f * ((float)shownProgressMs / (float)playerDurationMs);
         if (progressWidth < 0.0f) progressWidth = 0.0f;
-        if (progressWidth > 196.0f) progressWidth = 196.0f;
+        if (progressWidth > 326.0f) progressWidth = 326.0f;
     }
 
     snprintf(elapsedText, sizeof(elapsedText), "%d:%02d", progressSeconds / 60, progressSeconds % 60);
     snprintf(durationText, sizeof(durationText), "%d:%02d", durationSeconds / 60, durationSeconds % 60);
+    drawText(24.0f, 161.0f, elapsedText, 1.00f, COLOR_TEXT);
+    drawRectangle(91.0f, 166.0f, 326.0f, 9.0f, COLOR_DIM);
+    if (progressWidth > 0.0f) drawFilledRectangle(92.0f, 167.0f, progressWidth, 7.0f, COLOR_GREEN);
+    drawText(425.0f, 161.0f, durationText, 1.00f, COLOR_TEXT);
 
-    drawText(150.0f, 169.0f, elapsedText, 0.78f, COLOR_TEXT);
-    drawRectangle(195.0f, 171.0f, 196.0f, 8.0f, COLOR_DIM);
-    if (progressWidth > 0.0f)
-        drawFilledRectangle(195.0f, 171.0f, progressWidth, 8.0f, COLOR_GREEN);
-    drawText(407.0f, 169.0f, durationText, 0.78f, COLOR_TEXT);
+    drawRectangle(24.0f, 194.0f, 132.0f, 38.0f, COLOR_DIM);
+    drawRectangle(174.0f, 194.0f, 132.0f, 38.0f, COLOR_GREEN);
+    drawRectangle(324.0f, 194.0f, 132.0f, 38.0f, COLOR_DIM);
+    drawText(45.0f, 206.0f, "L PREV", 1.00f, COLOR_TEXT);
+    drawText(196.0f, 206.0f, "X PLAY", 1.00f, COLOR_GREEN);
+    drawText(365.0f, 206.0f, "R NEXT", 1.00f, COLOR_TEXT);
 
-    drawLine(150.0f, 195.0f, 458.0f, 195.0f, COLOR_DIM);
-
-    /* Controlli grandi e leggibili, senza footer globale. */
-    drawRectangle(150.0f, 207.0f, 70.0f, 42.0f, COLOR_GREEN);
-    drawRectangle(226.0f, 207.0f, 91.0f, 42.0f, COLOR_GREEN);
-    drawRectangle(323.0f, 207.0f, 64.0f, 42.0f, COLOR_GREEN);
-    drawRectangle(393.0f, 207.0f, 65.0f, 42.0f, COLOR_GREEN);
-    drawText(163.0f, 217.0f, "<|", 1.00f, COLOR_GREEN);
-    drawText(158.0f, 237.0f, "PREV", 0.66f, COLOR_TEXT);
-    drawText(260.0f, 216.0f, "||", 1.05f, COLOR_GREEN);
-    drawText(237.0f, 237.0f, "X PLAY", 0.66f, COLOR_TEXT);
-    drawText(342.0f, 217.0f, "|>", 1.00f, COLOR_GREEN);
-    drawText(335.0f, 237.0f, "NEXT", 0.66f, COLOR_TEXT);
-    drawText(411.0f, 217.0f, "<> ", 0.92f, COLOR_GREEN);
-    drawText(402.0f, 237.0f, "SYNC", 0.66f, COLOR_TEXT);
-
-    if (playerCommandRunning)
-        drawText(360.0f, 190.0f, "COMMAND...", 0.58f, COLOR_TEXT);
+    if (playerCommandRunning) drawText(348.0f, 181.0f, "COMMAND", 1.00f, COLOR_TEXT);
+    drawPageFooter("O BACK", "TRI SYNC");
 }
 
-void drawSettingsSelector(void)
+void getSettingValue(int index, char *buffer, int size)
 {
-    /* Selettore integrato nel pannello Settings. */
+    int batteryPercent;
+    int batteryMinutes;
+    int batteryVoltage;
+    int batteryTemp;
+    int powerOnline;
+    int charging;
+
+    buffer[0] = '\0';
+    switch (index)
+    {
+        case 0:
+            snprintf(buffer, size, "%s", getWlanStatusText());
+            break;
+        case 1:
+            snprintf(buffer, size, "%s", getHttpStatusText());
+            break;
+        case 2:
+            snprintf(buffer, size, "%s", getSpotifyStatusText());
+            break;
+        case 3:
+            batteryPercent = scePowerGetBatteryLifePercent();
+            if (batteryPercent < 0) snprintf(buffer, size, "--");
+            else snprintf(buffer, size, "%d PERCENT", batteryPercent);
+            break;
+        case 4:
+            powerOnline = scePowerIsPowerOnline();
+            snprintf(buffer, size, "%s", powerOnline ? "YES" : "NO");
+            break;
+        case 5:
+            charging = scePowerIsBatteryCharging();
+            snprintf(buffer, size, "%s", charging ? "YES" : "NO");
+            break;
+        case 6:
+            batteryVoltage = scePowerGetBatteryVolt();
+            snprintf(buffer, size, "%d MV", batteryVoltage);
+            break;
+        case 7:
+            batteryTemp = scePowerGetBatteryTemp();
+            snprintf(buffer, size, "%d C", batteryTemp);
+            break;
+        case 8:
+            batteryMinutes = scePowerGetBatteryLifeTime();
+            if (batteryMinutes < 0) snprintf(buffer, size, "--");
+            else snprintf(buffer, size, "%dH %02dM", batteryMinutes / 60, batteryMinutes % 60);
+            break;
+    }
 }
 
 void drawSettingsScreen(void)
 {
-    char detailText[32];
-    unsigned int c0 = selectedSetting == 0 ? COLOR_GREEN : COLOR_TEXT;
-    unsigned int c1 = selectedSetting == 1 ? COLOR_GREEN : COLOR_TEXT;
-    unsigned int c2 = selectedSetting == 2 ? COLOR_GREEN : COLOR_TEXT;
+    const char *labels[9] = {
+        "WLAN", "SERVER", "SPOTIFY", "BATTERY",
+        "EXT POWER", "CHARGING", "VOLTAGE", "TEMP", "TIME LEFT"
+    };
 
-    drawAppSidebar(4);
-    drawContentTitle("SETTINGS");
+    int firstVisible;
+    int row;
+    int index;
+    char value[48];
+    char errorLine[64];
 
-    if (selectedSetting == 0) drawFilledRectangle(148.0f, 72.0f, 300.0f, 25.0f, COLOR_DIM);
-    drawText(157.0f, 79.0f, "WLAN", 0.90f, c0);
-    drawText(350.0f, 79.0f, getWlanStatusText(), 0.84f, getWlanStatusColor());
+    drawPageHeader("SETTINGS");
 
-    if (selectedSetting == 1) drawFilledRectangle(148.0f, 107.0f, 300.0f, 25.0f, COLOR_DIM);
-    drawText(157.0f, 114.0f, "SERVER TEST", 0.90f, c1);
-    drawText(350.0f, 114.0f, getHttpStatusText(), 0.84f, getHttpStatusColor());
+    if (selectedSetting <= 1)
+        firstVisible = 0;
+    else if (selectedSetting >= 7)
+        firstVisible = 5;
+    else
+        firstVisible = selectedSetting - 1;
 
-    if (selectedSetting == 2) drawFilledRectangle(148.0f, 142.0f, 300.0f, 25.0f, COLOR_DIM);
-    drawText(157.0f, 149.0f, "SPOTIFY", 0.90f, c2);
-    drawText(350.0f, 149.0f, getSpotifyStatusText(), 0.78f, getSpotifyStatusColor());
+    settingsScroll = firstVisible;
 
-    drawLine(151.0f, 181.0f, 451.0f, 181.0f, COLOR_DIM);
-    drawText(157.0f, 194.0f, "CRT MODE", 0.78f, COLOR_DIM);
-    drawText(350.0f, 194.0f, "ACTIVE", 0.78f, COLOR_GREEN);
-
-    detailText[0] = '\0';
-    if (spotifyStatus == SPOTIFY_CONNECTED && spotifyUser[0] != '\0')
-        snprintf(detailText, sizeof(detailText), "%s", spotifyUser);
-    else if (wlanStatus == WLAN_ONLINE && wlanIp[0] != '\0')
-        snprintf(detailText, sizeof(detailText), "%s", wlanIp);
-
-    if (detailText[0] != '\0')
+    for (row = 0; row < 4; row++)
     {
-        drawText(157.0f, 220.0f, "INFO", 0.70f, COLOR_DIM);
-        drawText(201.0f, 220.0f, detailText, 0.70f, COLOR_GREEN);
+        index = firstVisible + row;
+
+        if (index >= 9)
+            break;
+
+        getSettingValue(
+            index,
+            value,
+            sizeof(value)
+        );
+
+        drawLargeInfoRow(
+            54.0f + row * 47.0f,
+            labels[index],
+            value,
+            index == selectedSetting
+        );
     }
-    drawText(382.0f, 245.0f, "O BACK", 0.72f, COLOR_DIM);
+
+    if (firstVisible > 0)
+        drawText(
+            430.0f,
+            45.0f,
+            "UP",
+            1.00f,
+            COLOR_GREEN
+        );
+
+    if (firstVisible + 4 < 9)
+        drawText(
+            446.0f,
+            236.0f,
+            "V",
+            1.00f,
+            COLOR_GREEN
+        );
+
+    /*
+       WLAN DIAGNOSTICS
+    */
+    if (
+        selectedSetting == 0 &&
+        wlanStatus == WLAN_ERROR
+    )
+    {
+        drawFilledRectangle(
+            0.0f,
+            223.0f,
+            480.0f,
+            49.0f,
+            COLOR_BG
+        );
+
+        drawLine(
+            22.0f,
+            222.0f,
+            458.0f,
+            222.0f,
+            COLOR_DIM
+        );
+
+        snprintf(
+            errorLine,
+            sizeof(errorLine),
+            "STAGE %s",
+            getWlanErrorStageText()
+        );
+
+        drawTextLimited(
+            24.0f,
+            230.0f,
+            errorLine,
+            40,
+            1.00f,
+            COLOR_TEXT
+        );
+
+        snprintf(
+            errorLine,
+            sizeof(errorLine),
+            "CODE 0X%08X",
+            (unsigned int)wlanErrorCode
+        );
+
+        drawTextLimited(
+            24.0f,
+            250.0f,
+            errorLine,
+            40,
+            1.00f,
+            COLOR_GREEN
+        );
+    }
+
+    /*
+       SERVER / TCP DIAGNOSTICS - v0.16.4 NETWORK TRACE
+    */
+    else if (
+        selectedSetting == 1 &&
+        httpStatus == HTTP_ERROR
+    )
+    {
+        char traceLine[96];
+
+        drawFilledRectangle(
+            0.0f,
+            170.0f,
+            480.0f,
+            102.0f,
+            COLOR_BG
+        );
+
+        drawLine(
+            22.0f,
+            169.0f,
+            458.0f,
+            169.0f,
+            COLOR_DIM
+        );
+
+        snprintf(
+            traceLine,
+            sizeof(traceLine),
+            "BACKEND %s:%d",
+            traceBackendIp[0] ? traceBackendIp : "?",
+            BACKEND_HTTP_PORT
+        );
+        drawTextLimited(24.0f, 178.0f, traceLine, 48, 0.72f, COLOR_TEXT);
+
+        snprintf(
+            traceLine,
+            sizeof(traceLine),
+            "SOCKET %d   CONNECT %d",
+            traceSocketResult,
+            traceConnectResult
+        );
+        drawTextLimited(24.0f, 194.0f, traceLine, 48, 0.72f, COLOR_TEXT);
+
+        snprintf(
+            traceLine,
+            sizeof(traceLine),
+            "SEND %d / %d",
+            traceSendResult,
+            traceSendExpected
+        );
+        drawTextLimited(24.0f, 210.0f, traceLine, 48, 0.72f, COLOR_TEXT);
+
+        snprintf(
+            traceLine,
+            sizeof(traceLine),
+            "RECV %d   INET ERRNO %d",
+            traceRecvResult,
+            traceInetErrno
+        );
+        drawTextLimited(24.0f, 226.0f, traceLine, 48, 0.72f, COLOR_TEXT);
+
+        snprintf(
+            traceLine,
+            sizeof(traceLine),
+            "STAGE %s   CODE 0X%08X",
+            getHttpErrorStageText(),
+            (unsigned int)httpErrorCode
+        );
+        drawTextLimited(24.0f, 242.0f, traceLine, 48, 0.72f, COLOR_GREEN);
+    }
+
+    /*
+       NORMAL FOOTER
+    */
+    else
+    {
+        drawPageFooter(
+            "UP/DOWN NAV",
+            selectedSetting < 3
+                ? "X ACTION"
+                : "O BACK"
+        );
+    }
 }
 
 /* --------------------------------------------------
@@ -2123,19 +2998,9 @@ void drawSettingsScreen(void)
 
 void drawInterface(void)
 {
-    sceGuStart(
-        GU_DIRECT,
-        list
-    );
-
-    sceGuClearColor(
-        COLOR_BG
-    );
-
-    sceGuClear(
-        GU_COLOR_BUFFER_BIT
-    );
-
+    sceGuStart(GU_DIRECT, list);
+    sceGuClearColor(COLOR_BG);
+    sceGuClear(GU_COLOR_BUFFER_BIT);
 
     drawScanlines();
 
@@ -2143,106 +3008,65 @@ void drawInterface(void)
     {
         drawBootScreen();
         bootFrame++;
-
-        if (bootFrame >= 150)
-        {
-            bootActive = 0;
-        }
+        if (bootFrame >= 150) bootActive = 0;
     }
     else
     {
-        drawFrame();
-
         switch (currentScreen)
-    {
-        case SCREEN_HOME:
-            drawHome();
-            break;
-
-        case SCREEN_SEARCH:
-            drawSearchScreen();
-            break;
-
-        case SCREEN_PLAYLISTS:
-            drawPlaylistsScreen();
-            break;
-
-        case SCREEN_LIBRARY:
-            drawLibraryScreen();
-            break;
-
-        case SCREEN_NOW_PLAYING:
-            drawNowPlayingScreen();
-            break;
-
-        case SCREEN_SETTINGS:
-            drawSettingsScreen();
-            break;
+        {
+            case SCREEN_HOME:        drawHome(); break;
+            case SCREEN_SEARCH:      drawSearchScreen(); break;
+            case SCREEN_PLAYLISTS:   drawPlaylistsScreen(); break;
+            case SCREEN_LIBRARY:     drawLibraryScreen(); break;
+            case SCREEN_NOW_PLAYING: drawNowPlayingScreen(); break;
+            case SCREEN_SETTINGS:    drawSettingsScreen(); break;
         }
     }
 
-
     sceGuFinish();
-
-    sceGuSync(
-        GU_SYNC_FINISH,
-        GU_SYNC_WHAT_DONE
-    );
-
+    sceGuSync(GU_SYNC_FINISH, GU_SYNC_WHAT_DONE);
     sceDisplayWaitVblankStart();
-
     sceGuSwapBuffers();
 }
 
-
 /* --------------------------------------------------
-   NAVIGAZIONE
+   NAVIGAZIONE v0.15.2
 -------------------------------------------------- */
 
-void openSelectedMenu(void)
+void setTopLevelScreenFromMenu(void)
 {
     switch (selectedMenu)
     {
         case 0:
-            currentScreen = SCREEN_SEARCH;
-            break;
-
-        case 1:
-            currentScreen = SCREEN_PLAYLISTS;
-            break;
-
-        case 2:
-            currentScreen = SCREEN_LIBRARY;
-            break;
-
-        case 3:
             currentScreen = SCREEN_NOW_PLAYING;
             startPlayerRefresh();
             break;
-
+        case 1:
+            currentScreen = SCREEN_SEARCH;
+            break;
+        case 2:
+            currentScreen = SCREEN_PLAYLISTS;
+            break;
+        case 3:
+            currentScreen = SCREEN_LIBRARY;
+            break;
         case 4:
             currentScreen = SCREEN_SETTINGS;
             selectedSetting = 0;
+            settingsScroll = 0;
+            break;
+        case 5:
+            sceKernelExitGame();
             break;
     }
 }
 
-
-/* --------------------------------------------------
-   INPUT
--------------------------------------------------- */
-
 void updateController(void)
 {
     SceCtrlData pad;
-
     static unsigned int oldButtons = 0;
 
-
-    sceCtrlPeekBufferPositive(
-        &pad,
-        1
-    );
+    sceCtrlPeekBufferPositive(&pad, 1);
 
     if (bootActive)
     {
@@ -2250,185 +3074,108 @@ void updateController(void)
         return;
     }
 
-
-    /*
-       HOME
-    */
+    if ((pad.Buttons & PSP_CTRL_START) && !(oldButtons & PSP_CTRL_START))
+    {
+        currentScreen = SCREEN_HOME;
+        oldButtons = pad.Buttons;
+        return;
+    }
 
     if (currentScreen == SCREEN_HOME)
     {
-        if (
-            (pad.Buttons & PSP_CTRL_DOWN) &&
-            !(oldButtons & PSP_CTRL_DOWN)
-        )
+        if ((pad.Buttons & PSP_CTRL_DOWN) && !(oldButtons & PSP_CTRL_DOWN))
         {
             selectedMenu++;
-
-            if (selectedMenu > 4)
-            {
-                selectedMenu = 0;
-            }
+            if (selectedMenu > 5) selectedMenu = 0;
         }
 
-
-        if (
-            (pad.Buttons & PSP_CTRL_UP) &&
-            !(oldButtons & PSP_CTRL_UP)
-        )
+        if ((pad.Buttons & PSP_CTRL_UP) && !(oldButtons & PSP_CTRL_UP))
         {
             selectedMenu--;
+            if (selectedMenu < 0) selectedMenu = 5;
+        }
 
-            if (selectedMenu < 0)
+        if ((pad.Buttons & PSP_CTRL_CROSS) && !(oldButtons & PSP_CTRL_CROSS))
+            setTopLevelScreenFromMenu();
+    }
+    else if (currentScreen == SCREEN_SEARCH)
+    {
+        if ((pad.Buttons & PSP_CTRL_DOWN) && !(oldButtons & PSP_CTRL_DOWN))
+        {
+            if (searchResultCount > 0)
             {
-                selectedMenu = 4;
+                searchSelected++;
+                if (searchSelected >= searchResultCount) searchSelected = 0;
             }
         }
 
-
-        if (
-            (pad.Buttons & PSP_CTRL_CROSS) &&
-            !(oldButtons & PSP_CTRL_CROSS)
-        )
+        if ((pad.Buttons & PSP_CTRL_UP) && !(oldButtons & PSP_CTRL_UP))
         {
-            openSelectedMenu();
+            if (searchResultCount > 0)
+            {
+                searchSelected--;
+                if (searchSelected < 0) searchSelected = searchResultCount - 1;
+            }
         }
+
+        if ((pad.Buttons & PSP_CTRL_TRIANGLE) && !(oldButtons & PSP_CTRL_TRIANGLE))
+        {
+            if (!searchThreadRunning && !searchPlayRunning && openSearchOsk())
+                startSearch();
+        }
+
+        if ((pad.Buttons & PSP_CTRL_CROSS) && !(oldButtons & PSP_CTRL_CROSS))
+        {
+            if (searchResultCount > 0)
+                playSelectedSearchResult();
+            else if (!searchThreadRunning && !searchPlayRunning && openSearchOsk())
+                startSearch();
+        }
+
+        if ((pad.Buttons & PSP_CTRL_CIRCLE) && !(oldButtons & PSP_CTRL_CIRCLE))
+            currentScreen = SCREEN_HOME;
     }
-
-
-    /*
-       SETTINGS
-    */
-
     else if (currentScreen == SCREEN_SETTINGS)
     {
-        if (
-            (pad.Buttons & PSP_CTRL_DOWN) &&
-            !(oldButtons & PSP_CTRL_DOWN)
-        )
+        if ((pad.Buttons & PSP_CTRL_DOWN) && !(oldButtons & PSP_CTRL_DOWN))
         {
             selectedSetting++;
-
-            if (selectedSetting > 3)
-            {
-                selectedSetting = 0;
-            }
+            if (selectedSetting > 8) selectedSetting = 0;
         }
 
-
-        if (
-            (pad.Buttons & PSP_CTRL_UP) &&
-            !(oldButtons & PSP_CTRL_UP)
-        )
+        if ((pad.Buttons & PSP_CTRL_UP) && !(oldButtons & PSP_CTRL_UP))
         {
             selectedSetting--;
-
-            if (selectedSetting < 0)
-            {
-                selectedSetting = 3;
-            }
+            if (selectedSetting < 0) selectedSetting = 8;
         }
 
-
-        /*
-           Se WLAN è selezionato,
-           X avvia la connessione.
-        */
-
-        if (
-            selectedSetting == 0 &&
-            (pad.Buttons & PSP_CTRL_CROSS) &&
-            !(oldButtons & PSP_CTRL_CROSS)
-        )
+        if ((pad.Buttons & PSP_CTRL_CROSS) && !(oldButtons & PSP_CTRL_CROSS))
         {
-            startWlanConnection();
+            if (selectedSetting == 0) startWlanConnection();
+            else if (selectedSetting == 1) startHttpTest();
+            else if (selectedSetting == 2) startSpotifyCheck();
         }
 
-
-        /*
-           Se SERVER TEST è selezionato,
-           X contatta il backend locale via socket TCP.
-        */
-
-        if (
-            selectedSetting == 1 &&
-            (pad.Buttons & PSP_CTRL_CROSS) &&
-            !(oldButtons & PSP_CTRL_CROSS)
-        )
-        {
-            startHttpTest();
-        }
-
-
-        if (
-            selectedSetting == 2 &&
-            (pad.Buttons & PSP_CTRL_CROSS) &&
-            !(oldButtons & PSP_CTRL_CROSS)
-        )
-        {
-            startSpotifyCheck();
-        }
-
-
-        if (
-            (pad.Buttons & PSP_CTRL_CIRCLE) &&
-            !(oldButtons & PSP_CTRL_CIRCLE)
-        )
-        {
+        if ((pad.Buttons & PSP_CTRL_CIRCLE) && !(oldButtons & PSP_CTRL_CIRCLE))
             currentScreen = SCREEN_HOME;
-        }
     }
-
-
-    /*
-       ALTRE SCHERMATE
-    */
-
     else
     {
         if (currentScreen == SCREEN_NOW_PLAYING)
         {
-            if (
-                (pad.Buttons & PSP_CTRL_CROSS) &&
-                !(oldButtons & PSP_CTRL_CROSS)
-            )
-            {
+            if ((pad.Buttons & PSP_CTRL_CROSS) && !(oldButtons & PSP_CTRL_CROSS))
                 sendPlayerCommand(PLAYER_CMD_PLAY_PAUSE);
-            }
-
-            if (
-                (pad.Buttons & PSP_CTRL_LEFT) &&
-                !(oldButtons & PSP_CTRL_LEFT)
-            )
-            {
+            if ((pad.Buttons & PSP_CTRL_LEFT) && !(oldButtons & PSP_CTRL_LEFT))
                 sendPlayerCommand(PLAYER_CMD_PREVIOUS);
-            }
-
-            if (
-                (pad.Buttons & PSP_CTRL_RIGHT) &&
-                !(oldButtons & PSP_CTRL_RIGHT)
-            )
-            {
+            if ((pad.Buttons & PSP_CTRL_RIGHT) && !(oldButtons & PSP_CTRL_RIGHT))
                 sendPlayerCommand(PLAYER_CMD_NEXT);
-            }
-
-            if (
-                (pad.Buttons & PSP_CTRL_TRIANGLE) &&
-                !(oldButtons & PSP_CTRL_TRIANGLE)
-            )
-            {
+            if ((pad.Buttons & PSP_CTRL_TRIANGLE) && !(oldButtons & PSP_CTRL_TRIANGLE))
                 startPlayerRefresh();
-            }
         }
 
-        if (
-            (pad.Buttons & PSP_CTRL_CIRCLE) &&
-            !(oldButtons & PSP_CTRL_CIRCLE)
-        )
-        {
+        if ((pad.Buttons & PSP_CTRL_CIRCLE) && !(oldButtons & PSP_CTRL_CIRCLE))
             currentScreen = SCREEN_HOME;
-        }
     }
-
 
     oldButtons = pad.Buttons;
 }

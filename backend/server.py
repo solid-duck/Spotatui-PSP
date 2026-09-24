@@ -7,10 +7,13 @@ import hashlib
 import json
 import secrets
 import time
+import socket
+import threading
 from pathlib import Path
 
 HOST = "0.0.0.0"
 PORT = 8080
+DISCOVERY_PORT = 8081
 
 CLIENT_ID = "b67c13b0a7d54eeab3dcd00f2f6a20f0"
 REDIRECT_URI = "http://127.0.0.1:8080/spotify/callback"
@@ -353,6 +356,79 @@ class SpotatuiHandler(BaseHTTPRequestHandler):
 
             return
 
+
+        if path == "/spotify/search":
+            try:
+                term = (query.get("q", [""])[0] or "").strip()
+
+                if not term:
+                    self.send_text(400, "EMPTY QUERY")
+                    return
+
+                result = spotify_api_get(
+                    "/search?" + urlencode(
+                        {
+                            "q": term,
+                            "type": "track",
+                            "limit": 5,
+                        }
+                    )
+                ) or {}
+
+                lines = []
+
+                for item in result.get("tracks", {}).get("items", []):
+                    artists = ", ".join(
+                        artist.get("name", "")
+                        for artist in item.get("artists", [])
+                        if artist.get("name")
+                    )
+
+                    title = psp_text(item.get("name") or "UNKNOWN TRACK")
+                    artist = psp_text(artists or "UNKNOWN ARTIST")
+                    track_id = item.get("id") or ""
+
+                    if track_id:
+                        lines.append(f"{title}|{artist}|{track_id}")
+
+                self.send_text(200, "\n".join(lines) if lines else "NONE")
+                print(f"[PSP] SEARCH -> {len(lines)} result(s) | {psp_text(term)}")
+
+            except HTTPError as error:
+                print("[SPOTIFY] /search HTTP error:", error.code)
+                self.send_text(error.code, "SEARCH ERROR")
+            except Exception as error:
+                print("[SPOTIFY] /search error:", error)
+                self.send_text(500, "SEARCH ERROR")
+
+            return
+
+        if path == "/spotify/play-track":
+            try:
+                track_id = (query.get("id", [""])[0] or "").strip()
+
+                if not track_id:
+                    self.send_text(400, "MISSING TRACK ID")
+                    return
+
+                spotify_api_request(
+                    "PUT",
+                    "/me/player/play",
+                    {"uris": [f"spotify:track:{track_id}"]},
+                )
+
+                self.send_text(204, "")
+                print(f"[PSP] PLAY TRACK -> {track_id}")
+
+            except HTTPError as error:
+                print("[SPOTIFY] /play-track HTTP error:", error.code)
+                self.send_text(error.code, "PLAY TRACK ERROR")
+            except Exception as error:
+                print("[SPOTIFY] /play-track error:", error)
+                self.send_text(500, "PLAY TRACK ERROR")
+
+            return
+
         if path == "/spotify/player":
             try:
                 playback = spotify_api_get("/me/player/currently-playing")
@@ -480,15 +556,42 @@ class SpotatuiHandler(BaseHTTPRequestHandler):
         return
 
 
+
+def discovery_server():
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(("0.0.0.0", DISCOVERY_PORT))
+
+    print(f"[DISCOVERY] UDP listening on 0.0.0.0:{DISCOVERY_PORT}")
+
+    while True:
+        try:
+            data, address = sock.recvfrom(256)
+
+            if data.strip() == b"SPOTATUI_DISCOVER":
+                sock.sendto(b"SPOTATUI_BACKEND", address)
+                print(f"[DISCOVERY] PSP found backend from {address[0]}")
+        except Exception as error:
+            print("[DISCOVERY] Error:", error)
+
+
 def main():
     load_token()
+
+    discovery_thread = threading.Thread(
+        target=discovery_server,
+        name="SpotatuiDiscovery",
+        daemon=True,
+    )
+    discovery_thread.start()
 
     server = HTTPServer((HOST, PORT), SpotatuiHandler)
 
     print("================================")
-    print(" SPOTATUI PSP BACKEND v0.10")
+    print(" SPOTATUI PSP BACKEND v0.12")
     print("================================")
-    print(f"Listening on {HOST}:{PORT}")
+    print(f"HTTP listening on {HOST}:{PORT}")
+    print(f"Discovery UDP on 0.0.0.0:{DISCOVERY_PORT}")
     print("Endpoints:")
     print("  /ping")
     print("  /spotify/login")
@@ -496,6 +599,8 @@ def main():
     print("  /spotify/status")
     print("  /spotify/me")
     print("  /spotify/player")
+    print("  /spotify/search?q=...")
+    print("  /spotify/play-track?id=...")
     print("  /spotify/play")
     print("  /spotify/pause")
     print("  /spotify/next")
